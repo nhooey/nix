@@ -214,3 +214,113 @@ EOF
   git add alt/deep/flake.nix
   [[ $(nix eval --raw --override-input sub "path:$TEST_ROOT/reldir/alt?dir=deep" .#tag) = "overridden" ]]
 )
+
+# https://github.com/NixOS/nix/issues/14762
+# top -> middle -> library, where 'library' has a relative 'subflake' input.
+# 'top' takes 'library' and 'subflake' from middle's lock file, and must
+# resolve 'subflake' against library's source tree. 'middle' has a 'subflake'
+# directory too, so resolving against middle's tree would pick the wrong flake
+# instead of failing.
+(
+  # 'path:' inputs without a fingerprint can't be cached.
+  export _NIX_TEST_BARF_ON_UNCACHEABLE=''
+
+  # Locking again keeps every input and fetches only the flake itself.
+  relockKeepsAll() {
+    local out
+    out=$(nix flake lock --debug "$1" 2>&1)
+    grepQuietInverse "creating new input" <<< "$out"
+    [[ $(grep -c "^got tree" <<< "$out") = 1 ]]
+  }
+
+  n14762="$TEST_ROOT/issue-14762"
+  mkdir -p "$n14762/library/subflake" "$n14762/middle/subflake" "$n14762/top"
+
+  cat > "$n14762/library/subflake/flake.nix" <<EOF
+{ outputs = _: { v = "library"; }; }
+EOF
+  cat > "$n14762/middle/subflake/flake.nix" <<EOF
+{ outputs = _: { v = "middle"; }; }
+EOF
+  cat > "$n14762/library/flake.nix" <<EOF
+{
+  inputs.subflake.url = "path:./subflake";
+  outputs = { subflake, ... }: { inherit (subflake) v; };
+}
+EOF
+  cat > "$n14762/middle/flake.nix" <<EOF
+{
+  inputs.library.url = "path:$n14762/library";
+  outputs = { library, ... }: { inherit (library) v; };
+}
+EOF
+  cat > "$n14762/top/flake.nix" <<EOF
+{
+  inputs.middle.url = "path:$n14762/middle";
+  outputs = { middle, ... }: { inherit (middle) v; };
+}
+EOF
+
+  nix flake lock "$n14762/middle"
+  [[ $(nix eval --no-write-lock-file --raw "$n14762/top#v") = library ]]
+
+  # 'subflake' is kept from middle's lock file, not locked again.
+  out=$(nix flake lock --debug "$n14762/top" 2>&1)
+  grepQuietInverse "creating new input 'middle/library/subflake'" <<< "$out"
+  relockKeepsAll "$n14762/top"
+
+  # 'middle2' overrides library's 'subflake' with a relative path of its own.
+  # Locking 'top2' again keeps 'middle2' without fetching it, and must still
+  # keep the override.
+  mkdir -p "$n14762/middle2/mysub" "$n14762/top2"
+  cat > "$n14762/middle2/mysub/flake.nix" <<EOF
+{ outputs = _: { v = "middle2"; }; }
+EOF
+  cat > "$n14762/middle2/flake.nix" <<EOF
+{
+  inputs.library.url = "path:$n14762/library";
+  inputs.library.inputs.subflake.url = "path:./mysub";
+  outputs = { library, ... }: { inherit (library) v; };
+}
+EOF
+  cat > "$n14762/top2/flake.nix" <<EOF
+{
+  inputs.middle2.url = "path:$n14762/middle2";
+  outputs = { middle2, ... }: { inherit (middle2) v; };
+}
+EOF
+  nix flake lock "$n14762/top2"
+  [[ $(nix eval --raw "$n14762/top2#v") = middle2 ]]
+  relockKeepsAll "$n14762/top2"
+
+  # Without 'parent', the lock file doesn't say which flake overrides
+  # 'subflake', so locking must read middle2's override again.
+  jq '(.nodes[] | select(has("parent"))) |= del(.parent)' "$n14762/top2/flake.lock" > "$TEST_ROOT/top2.lock"
+  mv "$TEST_ROOT/top2.lock" "$n14762/top2/flake.lock"
+  nix flake lock "$n14762/top2"
+  [[ $(nix eval --raw "$n14762/top2#v") = middle2 ]]
+  relockKeepsAll "$n14762/top2"
+
+  # An override in a flake that is read again isn't taken from the lock file,
+  # so removing it locks 'subflake' relative to 'library' again.
+  mkdir -p "$n14762/top3/mysub"
+  cat > "$n14762/top3/mysub/flake.nix" <<EOF
+{ outputs = _: { v = "top3"; }; }
+EOF
+  cat > "$n14762/top3/flake.nix" <<EOF
+{
+  inputs.library.url = "path:$n14762/library";
+  inputs.library.inputs.subflake.url = "path:./mysub";
+  outputs = { library, ... }: { inherit (library) v; };
+}
+EOF
+  nix flake lock "$n14762/top3"
+  [[ $(nix eval --raw "$n14762/top3#v") = top3 ]]
+  cat > "$n14762/top3/flake.nix" <<EOF
+{
+  inputs.library.url = "path:$n14762/library";
+  outputs = { library, ... }: { inherit (library) v; };
+}
+EOF
+  [[ $(nix eval --raw "$n14762/top3#v") = library ]]
+)
