@@ -1,0 +1,46 @@
+name: bench-15982
+
+# Builds Nix at the merge base with NixOS/nix master (baseline) and at the
+# commit under this one (candidate), then counts the trees each fetches
+# with contrib/bench-15982/bench.sh.
+# Runs on every push to the bench-15982 branch; fork it and push to rerun.
+on:
+  push:
+    branches: [bench-15982]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+      - name: Pick the baseline and candidate commits
+        id: revs
+        run: |
+          git fetch --no-tags https://github.com/NixOS/nix.git master
+          candidate=$(git rev-parse HEAD~1)
+          baseline=$(git merge-base FETCH_HEAD "$candidate")
+          echo "candidate=$candidate" >>"$GITHUB_OUTPUT"
+          echo "baseline=$baseline" >>"$GITHUB_OUTPUT"
+          {
+            echo "- baseline: [\`${baseline:0:9}\`](https://github.com/NixOS/nix/commit/$baseline), merge base with NixOS/nix master"
+            echo "- candidate: [\`${candidate:0:9}\`](https://github.com/${{ github.repository }}/commit/$candidate), NixOS/nix#15982"
+            echo
+          } >>"$GITHUB_STEP_SUMMARY"
+      - name: Build baseline and candidate
+        run: |
+          nix build -L --out-link baseline "git+file://$PWD?rev=${{ steps.revs.outputs.baseline }}#nix-cli"
+          nix build -L --out-link candidate "git+file://$PWD?rev=${{ steps.revs.outputs.candidate }}#nix-cli"
+      - name: Run the benchmark
+        run: nix run ./contrib/bench-15982 -- baseline/bin/nix candidate/bin/nix bench-out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: bench-15982
+          path: bench-out
